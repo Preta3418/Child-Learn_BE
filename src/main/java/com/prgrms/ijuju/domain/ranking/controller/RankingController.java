@@ -19,7 +19,8 @@ import org.springframework.web.bind.annotation.*;
 @RequiredArgsConstructor
 @Slf4j
 @RequestMapping("/api/v1/rank")
-public class RankingController {
+public class
+RankingController {
     private final RankingService rankingService;
     private final MemberRepository memberRepository;
 

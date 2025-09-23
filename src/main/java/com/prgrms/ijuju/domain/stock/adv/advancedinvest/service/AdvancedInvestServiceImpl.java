@@ -8,7 +8,6 @@ import com.prgrms.ijuju.domain.stock.adv.advancedinvest.exception.otherexception
 import com.prgrms.ijuju.domain.stock.adv.advancedinvest.exception.stockexception.DataNotFoundException;
 import com.prgrms.ijuju.domain.stock.adv.advancedinvest.exception.stockexception.InvalidQuantityException;
 import com.prgrms.ijuju.domain.stock.adv.advancedinvest.exception.stockexception.StockNotFoundException;
-import com.prgrms.ijuju.domain.stock.mid.exception.MidMemberNotFoundException;
 import com.prgrms.ijuju.global.util.WebSocketUtil;
 import com.prgrms.ijuju.domain.member.entity.Member;
 import com.prgrms.ijuju.domain.member.repository.MemberRepository;
@@ -22,14 +21,11 @@ import com.prgrms.ijuju.domain.stock.adv.advstock.repository.AdvStockRepository;
 import com.prgrms.ijuju.domain.stock.adv.stockrecord.constant.TradeType;
 import com.prgrms.ijuju.domain.stock.adv.stockrecord.dto.request.StockRecordRequestDto;
 import com.prgrms.ijuju.domain.stock.adv.stockrecord.service.StockRecordService;
-import com.prgrms.ijuju.domain.wallet.dto.request.WalletRequestDTO;
 import com.prgrms.ijuju.domain.wallet.service.WalletService;
 import com.prgrms.ijuju.domain.wallet.dto.request.StockPointRequestDTO;
 import com.prgrms.ijuju.domain.wallet.entity.StockType;
 import com.prgrms.ijuju.domain.wallet.entity.TransactionType;
 import lombok.RequiredArgsConstructor;
-import org.hibernate.Hibernate;
-import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -56,17 +52,41 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
     private final WalletService walletService;
     private final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(1);
 
-    // activeGame 은 이제 AdvancedInvest Id(gameId) 와 activeTimer 를 매핑하는 HashMap 입니다.
-    // 그냥 간단하게 타이머랑 게암 Id 를 합쳐서 보관한다고 생각하면 편안합니다.
-    private final Map<Long, ScheduledFuture<?>> activeGames = new ConcurrentHashMap<>();
 
-    private final Map<Long, Integer> countDown = new ConcurrentHashMap<>();
 
-    private final Map<Long, WebSocketSession> gameSessions = new ConcurrentHashMap<>();
 
-    private final Map<Long, Integer> liveSentCounter = new ConcurrentHashMap<>();
-
+    
+    private final Map<Long, GameState> gameStates = new ConcurrentHashMap<>();
     private final Map<Long, Long> memberIdToGameId = new ConcurrentHashMap<>();
+
+
+    private static class GameState {
+        private final ScheduledFuture<?> timer;
+        private final WebSocketSession session;
+        private volatile int currentSecond;
+        private volatile int liveSentCounter;
+
+        public GameState(ScheduledFuture<?> timer, WebSocketSession session) {
+            this.timer = timer;
+            this.session = session;
+            this.currentSecond = 0;
+            this.liveSentCounter = 0;
+        }
+
+        public synchronized void updateSecond(int second) {
+            this.currentSecond = second;
+        }
+
+        public synchronized void incrementLiveCounter() {
+            this.liveSentCounter++;
+        }
+
+        
+        public ScheduledFuture<?> getTimer() { return timer; }
+        public WebSocketSession getSession() { return session; }
+        public synchronized int getCurrentSecond() { return currentSecond; }
+        public synchronized int getLiveSentCounter() { return liveSentCounter; }
+    }
 
 
     //게임 타이머. 게임은 총 7분 진행되며, 1분은 장전 거래 시간, 5분은 거래 시간, 마지막 1분은 장후 거래 시간
@@ -80,46 +100,47 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
 
             public void run() {
                 try {
-                    countDown.put(gameId, second);
+                    GameState gameState = gameStates.get(gameId);
+                    if (gameState == null) {
+                        return; // Game state not found, stop execution
+                    }
+
+                    gameState.updateSecond(second);
 
                     if (second == 0) { // 장전 거래 시간 1분 > ReferenceData
                         sendReferenceData(session);
-                        liveSentCounter.put(gameId, 0);
 
-                    } else if (second >= 15 && second <= 90 && second % 15 == 0) { // 거래 시간 5분 > LiveData >> 총 6개의 데이터가 전돨되어야 한다.
-                        int livePhase = (second - 15) / 15;
-                        sendLiveData(session, livePhase);
-                        liveSentCounter.put(gameId, liveSentCounter.getOrDefault(gameId, 0) + 1);
+                    } else if (second >= 60 && second <= 310 && (second - 60) % 50 == 0) { // 거래 시간 5분 > LiveData >> 총 6개의 데이터가 전송
+                        int livePhase = (second - 60) / 50;
+                        if (livePhase < 6 && gameState.getLiveSentCounter() < 6) { // 최대 6개 데이터만 전송
+                            sendLiveData(session, livePhase);
+                            gameState.incrementLiveCounter();
+                        }
 
-                    } else if (second == 105) {
+                    } else if (second >= 420) {
                         endGame(gameId); // 게임 종료
                         sendEndSignal(session);
-
-                        // activeGame.remove(gameId) 시 남는것은 activeTimer (activeGame 은 {id, activeTimer} 이기 때문)
-                        // 즉 현재 진행중인 activeTimer 를 저장하는 과정.
-                        ScheduledFuture<?> activeTimer = activeGames.remove(gameId);
-                        memberIdToGameId.values().remove(gameId);
-                        if (activeTimer != null) {
-                            activeTimer.cancel(false); //타이머 정지
-                        }
-                        countDown.remove(gameId);
-                        liveSentCounter.remove(gameId);
+                        return; // Stop execution after game end
                     }
 
                     second++; // 다음 초로 진행
 
+                } catch (DataNotFoundException | StockNotFoundException e) {
+                    // 데이터 관련 예외는 게임을 종료
+                    endGame(gameId);
                 } catch (Exception e) {
+                    // 기타 예외는 로깅 후 게임 일시정지
                     e.printStackTrace();
-                    pauseGame(gameId); // 예외 발생 시 현재 초로 게임 일시 정지
+                    pauseGame(gameId);
                 }
             }
         };
 
         //activeTimer 는 카운터 작업을 관리하는 객체
         ScheduledFuture<?> activeTimer = executorService.scheduleAtFixedRate(gameTask, 0, 1, TimeUnit.SECONDS);
-        activeGames.put(gameId, activeTimer);
-        countDown.put(gameId, startSecond);
-        gameSessions.put(gameId, session);
+        GameState gameState = new GameState(activeTimer, session);
+        gameState.updateSecond(startSecond);
+        gameStates.put(gameId, gameState);
     }
 
     // Reference Data
@@ -148,27 +169,37 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
             throw new DataNotFoundException();
         }
 
-        if (livePhase < liveData.size()) {
-            List<AdvStockResponseDto> responseDto = liveData.stream()
-                    .map(stock -> AdvStockResponseDto.fromEntity(stock, livePhase))  // 특정 시간 데이터를 전송
-                    .toList();
-            WebSocketUtil.send(session, responseDto);
-        }
+        List<AdvStockResponseDto> responseDto = liveData.stream()
+                .map(stock -> AdvStockResponseDto.fromEntity(stock, livePhase))  // 특정 시간 데이터를 전송
+                .toList();
+        WebSocketUtil.send(session, responseDto);
     }
 
     private void sendEndSignal(WebSocketSession session) {
         WebSocketUtil.send(session, "게임 종료");
     }
 
+    private void safeCloseWebSocketSession(WebSocketSession session) {
+        if (session != null && session.isOpen()) {
+            try {
+                session.close();
+            } catch (IOException e) {
+                // 로그만 남기고 예외는 무시 (게임 종료 과정에서 실패해도 계속 진행)
+                e.printStackTrace();
+            }
+        }
+    }
+
     // Volumes 조회
     @Transactional
     @Override
     public void getRecentVolumes(WebSocketSession session, String stockSymbol, Long gameId) {
-        if (!countDown.containsKey(gameId)) {
+        GameState gameState = gameStates.get(gameId);
+        if (gameState == null) {
             throw new GameNotFoundException();
         }
 
-        int liveSentCounterValue = liveSentCounter.getOrDefault(gameId, 0); // LiveData 전송 횟수
+        int liveSentCounterValue = gameState.getLiveSentCounter(); // LiveData 전송 횟수
 
         // 2. ReferenceData 가져오기
         List<Long> referenceVolumes = advStockRepository.findBySymbolAndDataType(stockSymbol, DataType.REFERENCE)
@@ -213,7 +244,7 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
         LocalTime startRestrictedTime = LocalTime.of(6, 0); // 오전 6시
         LocalTime endRestrictedTime = LocalTime.of(8, 0);   // 오전 8시
 
-        if (!now.isBefore(startRestrictedTime) && !now.isAfter(endRestrictedTime)) {
+        if (now.isAfter(startRestrictedTime) && now.isBefore(endRestrictedTime)) {
             throw new InvalidGameTimeException();
         }
 
@@ -250,21 +281,21 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
     @Override
     @Transactional
     public void pauseGame(Long gameId) {
-        ScheduledFuture<?> activeTimer = activeGames.remove(gameId);
-        if (activeTimer != null) {
-            activeTimer.cancel(false);
+        GameState gameState = gameStates.remove(gameId);
+        if (gameState == null) {
+            throw new GameNotFoundException();
         }
 
-        Integer currentSecond = countDown.get(gameId); // 현재 초수 가져오기
-        if (currentSecond == null) {
-            throw new GameNotFoundException();
+        ScheduledFuture<?> activeTimer = gameState.getTimer();
+        if (activeTimer != null) {
+            activeTimer.cancel(false);
         }
 
         AdvancedInvest advancedInvest = advancedInvestRepository.findById(gameId)
                 .orElseThrow(GameNotFoundException::new);
 
         advancedInvest.setPaused(true); // 게임은 일시정지 상태로 표시
-        advancedInvest.setCurrentSecond(currentSecond);
+        advancedInvest.setCurrentSecond(gameState.getCurrentSecond());
         advancedInvestRepository.save(advancedInvest);
     }
 
@@ -292,31 +323,32 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
         AdvancedInvest advancedInvest = advancedInvestRepository.findById(gameId)
                 .orElseThrow(GameNotFoundException::new);
 
+        GameState gameState = gameStates.remove(gameId);
+        memberIdToGameId.values().remove(gameId);
 
-        activeGames.remove(gameId);
+        if (gameState != null) {
+            ScheduledFuture<?> timer = gameState.getTimer();
+            if (timer != null) {
+                timer.cancel(false);
+            }
+
+            //웹소켓 종료
+            WebSocketSession session = gameState.getSession();
+            safeCloseWebSocketSession(session);
+        }
 
         advancedInvest.setPlayedToday(true);
         advancedInvestRepository.save(advancedInvest);
-
-        //웹소켓 종료
-        WebSocketSession session = gameSessions.remove(gameId);
-        if (session != null && session.isOpen()) {
-            try {
-                session.close();
-            } catch (IOException e) {
-                throw new RuntimeException("WebSocket 세션 종료 즁 오류 발생");
-            }
-        }
     }
 
     // 남은 시간 조회 메소드
     @Override
     public int getRemainingTime(Long gameId) {
-        Integer currentSecond = countDown.get(gameId);
-        if (currentSecond == null) {
+        GameState gameState = gameStates.get(gameId);
+        if (gameState == null) {
             throw new GameNotFoundException();
         }
-        return 420 - currentSecond; // 전체 시간에서 현재 초수 뺀 값 반환
+        return Math.max(0, 420 - gameState.getCurrentSecond()); // 전체 시간에서 현재 초수 뺀 값 반환
     }
 
 
@@ -330,7 +362,8 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
         advancedInvestRepository.resetPlayedToday();
 
         // 진행 중인 게임 강제 종료
-        for (Long gameId : activeGames.keySet()) {
+        List<Long> gameIds = new ArrayList<>(gameStates.keySet());
+        for (Long gameId : gameIds) {
             endGame(gameId);
         }
 
@@ -443,99 +476,3 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
         stockRecordService.saveRecord(recordRequest, advancedInvest.getMember());
     }
 }
-
-
-
-
-    /* 혹시나 해서 만들어둔 서비스로, 해당 기능을 중복적으로 사용해서 만들어 뒀음. 근데 어차피 Exception 핸들링을 전부 리팩토링 할거라 지금은 폐기
-
-    private AdvancedInvest getAdvancedInvestById(Long gameId) {
-        return advancedInvestRepository.findById(gameId)
-                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 게임입니다."));
-    }
-}
-
-     */
-
-
-    /* Http Request 용 startGame
-
-    @Transactional
-    @Override
-    public AdvancedInvestResponseDto startGame(AdvancedInvestRequestDto request) {
-
-        Member member = memberRepository.findById(request.getMemberId())
-                .orElseThrow(() -> new IllegalArgumentException("해당 ID의 회원을 찾을 수 없습니다."));
-
-        Optional<AdvancedInvest> existingInvest = advancedInvestRepository.findByMemberIdAndPlayedTodayTrue(request.getMemberId());
-        if (existingInvest.isPresent()) {
-            throw new IllegalStateException("오늘 이미 게임을 실행했습니다.");
-        }
-
-        AdvancedInvest advancedInvest = advancedInvestRepository.save(
-                AdvancedInvest.builder()
-                        .member(member)
-                        .startTime(System.currentTimeMillis())
-                        .paused(false)
-                        .build()
-        );
-        return AdvancedInvestResponseDto.from(advancedInvest);
-    }
-     */
-
-
-    /* Http Request 용 start, pause, end game
-
-    @Transactional
-    @Override
-    public void pauseGame(Long advId) {
-        AdvancedInvest advancedInvest = getAdvancedInvestById(advId);
-        advancedInvest.setPaused(true);
-    }
-
-    @Transactional
-    @Override
-    public void resumeGame(Long advId) {
-        AdvancedInvest advancedInvest = getAdvancedInvestById(advId);
-        advancedInvest.setPaused(false);
-    }
-
-    @Transactional
-    @Override
-    public void endGame(Long advId) {
-        AdvancedInvest advancedInvest = getAdvancedInvestById(advId);
-        advancedInvest.setPlayedToday(false);
-        advancedInvest.setPlayedToday(true);
-        advancedInvestRepository.save(advancedInvest);
-    }
-     */
-
-
-
-   /*
-     * Http Request 용 Live / Reference Data 참조
-    @Transactional(readOnly = true)
-    @Override
-    public StockResponseDto getLiveData(Long advId, String symbol, int hour) {
-        List<AdvStock> stocks = advStockRepository.findBySymbolAndAdvIdOrderByTimestampAsc(symbol, advId);
-
-        if (hour <= 0 || hour > stocks.size()) {
-            throw new IllegalArgumentException("유효하지 않은 hour 값입니다.");
-        }
-
-        AdvStock stock = stocks.get(hour - 1);
-
-        return StockResponseDto.fromEntity(stock);
-    }
-
-
-    @Transactional(readOnly = true)
-    @Override
-    public List<StockResponseDto> getReferenceData(Long advId) {
-        return advStockRepository.findAllByDataType("REFERENCE")
-                .stream()
-                .map(StockResponseDto::fromEntity)
-                .collect(Collectors.toList());
-    }
-
-     */
