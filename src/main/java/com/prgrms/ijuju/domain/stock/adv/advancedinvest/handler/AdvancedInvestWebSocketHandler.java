@@ -12,6 +12,7 @@ import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.math.BigDecimal;
@@ -146,6 +147,18 @@ public class AdvancedInvestWebSocketHandler extends TextWebSocketHandler {
         }
         if (requestDto.getPoints() == null || requestDto.getPoints().compareTo(BigDecimal.ZERO) <= 0) {
             throw new IllegalArgumentException("유효한 포인트 값이 필요합니다.");
+        }
+    }
+
+    @Override
+    public void afterConnectionClosed(@NonNull WebSocketSession session, @NonNull CloseStatus status) throws Exception {
+        log.info("WebSocket connection closed: {} with status: {}", session.getId(), status);
+
+
+        try {
+            log.info("Session {} disconnected, games will be cleaned up by scheduled task", session.getId());
+        } catch (Exception e) {
+            log.error("Error during session cleanup: {}", e.getMessage(), e);
         }
     }
 }

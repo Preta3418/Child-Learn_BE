@@ -30,7 +30,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.socket.WebSocketSession;
-
+import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.LocalTime;
@@ -81,7 +81,7 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
             this.liveSentCounter++;
         }
 
-        
+
         public ScheduledFuture<?> getTimer() { return timer; }
         public WebSocketSession getSession() { return session; }
         public synchronized int getCurrentSecond() { return currentSecond; }
@@ -144,7 +144,7 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
     }
 
     // Reference Data
-    //LazyInitializationException 이 생겨서 문제 해결하려고 발악했었음.
+    //LazyInitializationException 이 생겨서 문제 해결
     @Transactional
     public void sendReferenceData(WebSocketSession session) {
         List<AdvStock> referenceData = advStockRepository.findByDataType(DataType.REFERENCE);
@@ -324,7 +324,8 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
                 .orElseThrow(GameNotFoundException::new);
 
         GameState gameState = gameStates.remove(gameId);
-        memberIdToGameId.values().remove(gameId);
+        
+        memberIdToGameId.entrySet().removeIf(entry -> entry.getValue().equals(gameId));
 
         if (gameState != null) {
             ScheduledFuture<?> timer = gameState.getTimer();
@@ -443,7 +444,7 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
         }
 
         // 보유 주식 수량 확인
-        double ownedQuantity = stockRecordService.calculateOwnedStock(gameId, request.getStockSymbol());
+        double ownedQuantity = stockRecordService.calculateOwnedStock(request.getMemberId(), request.getStockSymbol());
         if (ownedQuantity < request.getQuantity()) {
             throw new IllegalArgumentException("보유 수량보다 많은 주식을 판매할 수 없습니다.");
         }
@@ -475,4 +476,21 @@ public class AdvancedInvestServiceImpl implements AdvancedInvestService {
         // 거래 내역 저장
         stockRecordService.saveRecord(recordRequest, advancedInvest.getMember());
     }
+
+    @PreDestroy
+    public void shutdown() {
+
+        if (executorService != null && !executorService.isShutdown()) {
+            executorService.shutdown();
+            try {
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executorService.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executorService.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
 }
+
