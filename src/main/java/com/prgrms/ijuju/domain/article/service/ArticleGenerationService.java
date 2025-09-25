@@ -48,12 +48,17 @@ public class ArticleGenerationService {
     }
 
     public void generateArticles(List<Trend> trends, DataType type) {
-        String randomKeyword = getRandomKeyword();
+        if (trends == null || trends.isEmpty()) {
+            log.warn("No trends provided for article generation");
+            return;
+        }
 
         for (Trend trend : trends) {
             try {
+                String randomKeyword = getRandomKeyword();
                 Article article = createArticleFromTrend(trend, type, randomKeyword);
                 articleRepository.save(article);
+                log.debug("Article generated for trend: {}", trend.getStockSymbol());
             } catch (Exception e) {
                 log.error("Failed to generate article for trend: {}", trend, e);
             }
@@ -69,12 +74,14 @@ public class ArticleGenerationService {
     }
 
     private String gptResponse(String trendData, String keyword) {
+        if (trendData == null || trendData.trim().isEmpty()) {
+            throw new ArticleGenerationException(ArticleErrorCode.PARSE_FAILURE);
+        }
 
         List<Map<String, Object>> messages = List.of(
                 Map.of("role", SYSTEM_ROLE, "content", getSystemContent(keyword)),
                 Map.of("role", "user", "content", "다음 트렌드를 기반으로 기사를 작성해줘:\n" + trendData)
         );
-
 
         Map<String, Object> request = Map.of(
                 "model", MODEL,
@@ -82,12 +89,21 @@ public class ArticleGenerationService {
                 "temperature", TEMPERATURE
         );
 
+        Map<String, Object> response;
+        try {
+            response = chatGptRestClient.post()
+                    .uri("/chat/completions")
+                    .body(request)
+                    .retrieve()
+                    .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        } catch (Exception e) {
+            log.error("ChatGPT API call failed", e);
+            throw new ArticleGenerationException(ArticleErrorCode.PARSE_FAILURE);
+        }
 
-        Map<String, Object> response = chatGptRestClient.post()
-                .uri("/chat/completions")
-                .body(request)
-                .retrieve()
-                .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        if (response == null) {
+            throw new ArticleGenerationException(ArticleErrorCode.NO_RESPONSE_CHOICES);
+        }
 
 
         @SuppressWarnings("unchecked")
@@ -97,9 +113,22 @@ public class ArticleGenerationService {
         }
 
         Map<String, Object> firstChoice = choices.get(0);
-        Map<String, String> message = (Map<String, String>) firstChoice.get("message");
+        if (firstChoice == null) {
+            throw new ArticleGenerationException(ArticleErrorCode.NO_RESPONSE_CHOICES);
+        }
 
-        return message.get("content");
+        @SuppressWarnings("unchecked")
+        Map<String, String> message = (Map<String, String>) firstChoice.get("message");
+        if (message == null) {
+            throw new ArticleGenerationException(ArticleErrorCode.PARSE_FAILURE);
+        }
+
+        String content = message.get("content");
+        if (content == null || content.trim().isEmpty()) {
+            throw new ArticleGenerationException(ArticleErrorCode.PARSE_FAILURE);
+        }
+
+        return content;
     }
 
     private String formatTrendData(Trend trend) {

@@ -22,5 +22,9 @@ public interface ArticleRepository extends JpaRepository<Article, Long> {
 
     long countByType(DataType type);
 
+    @Modifying
+    @Transactional
+    @Query("UPDATE Article a SET a.duration = a.duration - 1")
+    void decrementAllDurations();
 
 }
